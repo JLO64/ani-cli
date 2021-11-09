@@ -6,6 +6,7 @@ player_fn="mpv"
 
 prog="ani-cli"
 logfile="${XDG_CACHE_HOME:-$HOME/.cache}/ani-hsts"
+base_url="https://gogoanime.cm"
 
 c_red="\033[1;31m"
 c_green="\033[1;32m"
@@ -45,7 +46,7 @@ search_anime () {
 	search=$(printf '%s' "$1" | tr ' ' '-' )
 	titlepattern='<a href="/category/'
 
-	curl -s "https://gogoanime.pe//search.html" \
+	curl -s "$base_url//search.html" \
 		-G \
 		-d "keyword=$search" |
 	sed -n -E '
@@ -57,7 +58,7 @@ search_eps () {
 	# get available episodes for anime_id
 	anime_id=$1
 
-	curl -s "https://gogoanime.pe/category/$anime_id" |
+	curl -s "$base_url/category/$anime_id" |
 	sed -n -E '
 		/^[[:space:]]*<a href="#" class="active" ep_start/{
 		s/.* '\''([0-9]*)'\'' ep_end = '\''([0-9]*)'\''.*/\2/p
@@ -73,7 +74,7 @@ get_embedded_video_link() {
 
 	# credits to fork: https://github.com/Dink4n/ani-cli for the fix
 	# dub prefix takes the value "-dub" when dub is needed else is empty
-	curl -s "https://gogoanime.pe/$anime_id${dub_prefix}-episode-$ep_no" |
+	curl -s "$base_url/$anime_id${dub_prefix}-episode-$ep_no" |
 	sed -n -E '
 		/^[[:space:]]*<a href="#" rel="100"/{
 		s/.*data-video="([^"]*)".*/https:\1/p
@@ -129,7 +130,15 @@ get_links () {
 dep_ch () {
 	for dep; do
 		if ! command -v "$dep" >/dev/null ; then
-			die "Program \"$dep\" not found. Please install it."
+			die "Program \"$dep\" not found. Please install it.\n"
+		fi
+	done
+}
+
+optional_dep_ch () {
+	for optional_dep; do
+		if ! command -v "$optional_dep" >/dev/null ; then
+			printf "Optional program \"$optional_dep\" not found. It is recommended to install it.\n"
 		fi
 	done
 }
@@ -214,9 +223,33 @@ episode_selection () {
 	fi
 }
 
+check_input() {
+	[ "$ep_choice_start" -eq "$ep_choice_start" ] 2>/dev/null || die "Invalid number entered"
+	episodes=$ep_choice_start
+	if [ -n "$ep_choice_end" ]; then
+		[ "$ep_choice_end" -eq "$ep_choice_end" ] 2>/dev/null || die "Invalid number entered"
+		# create list of episodes to download/watch
+		episodes=$(seq $ep_choice_start $ep_choice_end)
+	fi
+}
+
+append_history () {
+	grep -q -w "${selection_id}" "$logfile" ||
+		printf "%s\t%d\n" "$selection_id" $((episode+1)) >> "$logfile"
+}
+
+open_selection() {
+	for ep in $episodes
+	do
+		open_episode "$selection_id" "$ep" "$ep_choice_start_time"
+	done
+	episode=${ep_choice_end:-$ep_choice_start}
+}
+
 open_episode () {
 	anime_id=$1
 	episode=$2
+	episode_start_time=$3
 
 	# Cool way of clearing screen
 	tput reset
@@ -251,8 +284,7 @@ open_episode () {
 		sed -E "
 			s/^${selection_id}\t[0-9]+/${selection_id}\t$((episode+1))/
 		" "$logfile" > "${logfile}.new" && mv "${logfile}.new" "$logfile"
-
-		setsid -f $player_fn --http-header-fields="Referer: $embedded_video_url" "$video_url" >/dev/null 2>&1
+		setsid -f $player_fn --http-header-fields="Referer: $embedded_video_url" "$video_url" "--input-ipc-server=/tmp/mpvsocket" "--start=+$episode_start_time" >/dev/null 2>&1
 	else
 		printf "Downloading episode $episode ...\n"
 		printf "%s\n" "$video_url"
@@ -275,6 +307,11 @@ open_episode () {
 trap "printf '$c_reset'" INT HUP
 
 dep_ch "$player_fn" "curl" "sed" "grep"
+optional_dep_ch "socat" "jq"
+
+#I don't really know where else to declare these variable, move it to somewhere better
+ep_choice_start_time=0
+record_playback_history=true
 
 # option parsing
 is_download=0
@@ -324,33 +361,18 @@ case $scrape in
 		episode_selection
 		;;
 	history)
-		search_results=$(sed -n -E 's/\t[0-9]*//p' "$logfile")
+		search_results=$(sed 's/\t[0-9]*//g' "$logfile")
 		[ -z "$search_results" ] && die "History is empty"
 		anime_selection "$search_results"
-		ep_choice_start=$(sed -n -E "s/${selection_id}\t//p" "$logfile")
+		ep_choice_start=$(grep -i "$selection_id" "$logfile" | cut -d "	" -f 2)
+		ep_choice_start_time=$(grep -i "$selection_id" "$logfile" | cut -d "	" -f 3)
+		if [ ${#ep_choice_start_time} -lt 1 ]; then ep_choice_start_time=0; fi #Redundancy for the old history file format
 		;;
 esac
 
-{ # checking input
-	[ "$ep_choice_start" -eq "$ep_choice_start" ] 2>/dev/null || die "Invalid number entered"
-	episodes=$ep_choice_start
-
-	if [ -n "$ep_choice_end" ]; then
-		[ "$ep_choice_end" -eq "$ep_choice_end" ] 2>/dev/null || die "Invalid number entered"
-		# create list of episodes to download/watch
-		episodes=$(seq $ep_choice_start $ep_choice_end)
-	fi
-}
-
-# add anime to history file
-grep -q -w "${selection_id}" "$logfile" ||
-	printf "%s\t%d\n" "$selection_id" $((episode+1)) >> "$logfile"
-
-for ep in $episodes
-do
-	open_episode "$selection_id" "$ep"
-done
-episode=${ep_choice_end:-$ep_choice_start}
+check_input
+append_history
+open_selection
 
 while :; do
 	printf "\n${c_green}Currently playing %s episode ${c_cyan}%d/%d\n" "$selection_id" $episode $last_ep_number
@@ -364,8 +386,28 @@ while :; do
 		printf "$c_blue[${c_cyan}%s$c_blue] $c_yellow%s$c_reset\n" "s" "select episode"
 	fi
 	printf "$c_blue[${c_cyan}%s$c_blue] $c_magenta%s$c_reset\n" "r" "replay current episode"
+	printf "$c_blue[${c_cyan}%s$c_blue] $c_cyan%s$c_reset\n" "a" "search for another anime"
 	printf "$c_blue[${c_cyan}%s$c_blue] $c_red%s$c_reset\n" "q" "exit"
 	printf "${c_blue}Enter choice:${c_green} "
+
+	#Start a background process that checks for playback progress and writes it
+	if [ $record_playback_history = true ]; then
+		while true
+		do
+			sleep 10s
+			POSITION=$(echo '{ "command": ["get_property_string", "time-pos"] }' | socat - /tmp/mpvsocket 2>/dev/null | jq -r .data | cut -d'.' -f 1)
+			REMAINING=$(echo '{ "command": ["get_property_string", "time-remaining"] }' | socat - /tmp/mpvsocket 2>/dev/null | jq .data | tr '"' ' ' | cut -d'.' -f 1)
+			if [ ${#POSITION} -lt 1 ]; then break; fi
+			if [ $REMAINING -lt 15 ];
+				#If there are less than 15 sec left in episode switch location to start of next episode to prevent issues when resuming playback from -H
+				then historyFileLine=$(printf "%s\t%d\t%d\n" "$selection_id" "$((episode+1))" 0) 2>/dev/null
+				else historyFileLine=$(printf "%s\t%d\t%d\n" "$selection_id" "$episode" "$POSITION") 2>/dev/null
+			fi
+			
+			sed -i "/$selection_id/ c \\$historyFileLine" "$logfile"
+		done &
+	fi
+
 	read choice
 	printf "$c_reset"
 	case $choice in
@@ -385,14 +427,30 @@ while :; do
 		r)
 			episode=$((episode))
 			;;
+		a)
+			tput reset
+			get_search_query ""
+			search_results=$(search_anime "$query")
+			[ -z "$search_results" ] && die "No search results found"
+			anime_selection "$search_results"
+			episode_selection
+			check_input
+			append_history
+			open_selection
+			continue
+			;;
 
 		q)
+			#first kill the background process checking for playback progress then break
+			jobtokill=$(jobs -l | grep "Running" | grep -o "[[:digit:]]\{3,10\}")
+			if [ ${#jobtokill} -gt 1 ]; then kill $jobtokill >/dev/null; fi
 			break;;
+			
 
 		*)
 			die "invalid choice"
 			;;
 	esac
 
-	open_episode "$selection_id" "$episode"
+	open_episode "$selection_id" "$episode" "0"
 done
